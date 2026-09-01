@@ -1,4 +1,4 @@
-import AVFoundation
+import os
 import XCTest
 
 @testable import FluidAudio
@@ -8,22 +8,26 @@ final class OfflineDiarizerCancellationTests: XCTestCase {
     func testCancellingFileProcessingStopsAllInferenceWorkers() async throws {
         try requireOfflineDiarizerModels()
 
-        let fixture = try DiarizationTestFixtures.fixtureAudio(sampleRate: 16_000)
-        var longMeeting: [Float] = []
-        longMeeting.reserveCapacity(fixture.count * 60)
-        for _ in 0..<60 {
-            longMeeting.append(contentsOf: fixture)
+        guard
+            let audioPath = ProcessInfo.processInfo.environment[
+                "FLUIDAUDIO_CANCELLATION_TEST_AUDIO"
+            ],
+            FileManager.default.fileExists(atPath: audioPath)
+        else {
+            throw XCTSkip(
+                "Set FLUIDAUDIO_CANCELLATION_TEST_AUDIO to a real meeting recording"
+            )
         }
-
-        let audioURL = try writeWAV(samples: longMeeting, sampleRate: 16_000)
-        defer { try? FileManager.default.removeItem(at: audioURL) }
+        let audioURL = URL(fileURLWithPath: audioPath)
 
         let manager = OfflineDiarizerManager()
         let progress = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let progressCount = OSAllocatedUnfairLock<Int>(initialState: 0)
         var progressIterator = progress.stream.makeAsyncIterator()
 
         let processingTask = Task {
             try await manager.process(audioURL) { _, _ in
+                progressCount.withLock { $0 += 1 }
                 progress.continuation.yield(())
             }
         }
@@ -50,8 +54,16 @@ final class OfflineDiarizerCancellationTests: XCTestCase {
         let cancellationDuration = cancellationStart.duration(to: .now)
         XCTAssertLessThan(
             cancellationDuration,
-            .seconds(5),
+            .seconds(2),
             "Cancellation should stop segmentation and embedding between model calls"
+        )
+
+        let countWhenCancelledCallReturned = progressCount.withLock { $0 }
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(
+            progressCount.withLock { $0 },
+            countWhenCancelledCallReturned,
+            "No inference progress may continue after process(URL) returns"
         )
     }
 
@@ -64,37 +76,5 @@ final class OfflineDiarizerCancellationTests: XCTestCase {
         guard allPresent else {
             throw XCTSkip("Offline diarizer models not available")
         }
-    }
-
-    private func writeWAV(samples: [Float], sampleRate: Double) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("offline-diarizer-cancellation-\(UUID().uuidString)")
-            .appendingPathExtension("wav")
-        let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: false
-        )!
-        let buffer = AVAudioPCMBuffer(
-            pcmFormat: format,
-            frameCapacity: AVAudioFrameCount(samples.count)
-        )!
-        buffer.frameLength = buffer.frameCapacity
-        samples.withUnsafeBufferPointer { source in
-            buffer.floatChannelData![0].update(
-                from: source.baseAddress!,
-                count: samples.count
-            )
-        }
-
-        let file = try AVAudioFile(
-            forWriting: url,
-            settings: format.settings,
-            commonFormat: .pcmFormatFloat32,
-            interleaved: false
-        )
-        try file.write(from: buffer)
-        return url
     }
 }
